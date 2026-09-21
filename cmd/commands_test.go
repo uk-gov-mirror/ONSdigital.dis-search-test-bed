@@ -4,6 +4,7 @@ import (
 	"io"
 	"testing"
 
+	"github.com/ONSdigital/dis-search-test-bed/algorithm"
 	. "github.com/smartystreets/goconvey/convey"
 	"github.com/spf13/cobra"
 )
@@ -22,7 +23,7 @@ func TestLoad(t *testing.T) {
 		root, err := Load()
 		So(err, ShouldBeNil)
 
-		compareCmd := findCommand(root.Commands(), "compare")
+		compareCmd := findCommand(root.Commands(), compareCommandName)
 		exportCmd := findCommand(root.Commands(), exportCommandName)
 		importCmd := findCommand(root.Commands(), importCommandName)
 
@@ -39,6 +40,20 @@ func TestLoad(t *testing.T) {
 		Convey("Then export requires the output flag and import requires the input flag", func() {
 			So(exportCmd.Flag("output"), ShouldNotBeNil)
 			So(importCmd.Flag("input"), ShouldNotBeNil)
+		})
+
+		Convey("Then compare accepts an optional list of algorithms", func() {
+			flag := compareCmd.Flag(compareAlgorithmFlag)
+			So(flag, ShouldNotBeNil)
+			So(flag.Shorthand, ShouldEqual, "a")
+			So(flag.Value.Type(), ShouldEqual, "stringSlice")
+			So(flag.DefValue, ShouldEqual, "[]")
+		})
+
+		Convey("Then compare lists the available algorithms in its help", func() {
+			for _, name := range algorithm.SearchAlgorithmNames() {
+				So(compareCmd.Long, ShouldContainSubstring, name)
+			}
 		})
 
 		Convey("Then the verbose persistent flag is defined", func() {
@@ -78,6 +93,27 @@ func TestImportCommandRequiresInput(t *testing.T) {
 			Convey("Then it should reject the missing required flag", func() {
 				So(err, ShouldNotBeNil)
 				So(err.Error(), ShouldContainSubstring, `required flag(s) "input" not set`)
+			})
+		})
+	})
+}
+
+func TestCompareCommandRejectsUnknownAlgorithm(t *testing.T) {
+	Convey("Given a compare command asked for an unregistered algorithm", t, func() {
+		command := compareCommand()
+		command.SetOut(io.Discard)
+		command.SetErr(io.Discard)
+		command.SetArgs([]string{"--" + compareAlgorithmFlag + "=baseline,freshness"})
+
+		Convey("When the command is executed", func() {
+			// The name is resolved before any Elasticsearch work, so this must
+			// fail without starting a container.
+			err := command.Execute()
+
+			Convey("Then it should reject the name and list the valid algorithms", func() {
+				So(err, ShouldNotBeNil)
+				So(err.Error(), ShouldEqual,
+					`unknown algorithm "freshness": valid algorithms are baseline, unweighted`)
 			})
 		})
 	})

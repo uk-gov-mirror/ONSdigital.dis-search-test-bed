@@ -82,6 +82,31 @@ func TestGetRequestBuilder(t *testing.T) {
 	})
 }
 
+func TestBuilderFor(t *testing.T) {
+	Convey("Given a RequestRegistry holding only the unweighted builder", t, func() {
+		registry := NewRequestRegistry([]SearchAlgorithm{SearchAlgorithmUnweighted})
+
+		Convey("When BuilderFor is called with the registered algorithm", func() {
+			builder, err := registry.BuilderFor(SearchAlgorithmUnweighted)
+
+			Convey("Then it should return that algorithm's builder", func() {
+				So(err, ShouldBeNil)
+				So(builder, ShouldNotBeNil)
+			})
+		})
+
+		Convey("When BuilderFor is called with an unregistered algorithm", func() {
+			builder, err := registry.BuilderFor(SearchAlgorithmBaseline)
+
+			Convey("Then it should error rather than falling back to baseline", func() {
+				So(err, ShouldNotBeNil)
+				So(err.Error(), ShouldEqual, `no request builder registered for search algorithm "baseline"`)
+				So(builder, ShouldBeNil)
+			})
+		})
+	})
+}
+
 func TestBuildRequest(t *testing.T) {
 	Convey("Given a baseline RequestBuilder", t, func() {
 		builder, err := NewSearchRequestBuilderBaseline()

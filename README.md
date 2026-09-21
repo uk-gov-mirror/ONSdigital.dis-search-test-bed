@@ -30,15 +30,41 @@ The tool has three commands. You can run them without building, using `go run .`
 
 ### compare
 
-Evaluate every term and log DCG, IDCG and NDCG per term (needs Docker):
+Evaluate every term with one or more algorithms against the same index, logging DCG, IDCG and NDCG per term, then compare each algorithm's NDCG side by side (needs Docker).
+
+Every algorithm is evaluated unless `--algorithms`/`-a` is given:
 
 ```sh
+# all algorithms (default)
 go run . compare
+
+# one algorithm
+go run . compare --algorithms baseline
+
+# several algorithms
+go run . compare --algorithms=baseline,unweighted
 ```
+
+Names are matched case-insensitively, duplicates are ignored, and the columns follow the canonical algorithm order rather than the order you list them in. An unrecognised name is rejected before Elasticsearch is started, so a typo fails immediately instead of silently reporting baseline results under another name. Run `go run . compare --help` for the available algorithms.
+
+The run ends with an NDCG table, one row per term and one column per algorithm:
+
+```text
+query_id         baseline   unweighted
+cpi-latest         0.5317       0.5317
+data               0.4200       0.4200
+growth-figures     0.6942       0.6942
+stat               0.0000       0.0000
+--------------------------------------
+mean NDCG          0.4115       0.4115
+```
+
+> [!NOTE]
+> Scores are calculated over the whole corpus: the search requests every document, DCG covers the full ranked list, and IDCG covers every judged grade. There is no `@K` cutoff yet.
 
 ### export
 
-Run the same evaluation and write each ranked result with its current judgement to a CSV (needs Docker). The output path is required:
+Run the same evaluation with the baseline algorithm and write each ranked result with its current judgement to a CSV (needs Docker). The CSV has no algorithm column, so the export is single-algorithm. The output path is required:
 
 ```sh
 go run . export -o results.csv

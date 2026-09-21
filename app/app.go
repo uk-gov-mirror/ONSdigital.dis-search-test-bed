@@ -1,17 +1,23 @@
 // Package app runs search-relevance evaluations against a throwaway
 // Elasticsearch instance: it indexes the test-set documents, evaluates every
-// term with the baseline algorithm, and either logs the scores (Compare) or
-// writes them to a CSV file (Export).
+// term with one or more search algorithms, and either logs the scores with a
+// comparison of each algorithm's NDCG (Compare) or writes the ranked results
+// to a CSV file (Export).
 package app
 
 import (
 	"context"
 	"strings"
 
+	"github.com/ONSdigital/dis-search-test-bed/algorithm"
 	"github.com/ONSdigital/dis-search-test-bed/testset/stream"
 	dpEsClient "github.com/ONSdigital/dp-elasticsearch/v4/client"
 	"github.com/pkg/errors"
 )
+
+// exportAlgorithm is the algorithm whose ranking Export evaluates. The export
+// CSV has no algorithm column, so the export stays single-algorithm.
+const exportAlgorithm = algorithm.SearchAlgorithmBaseline
 
 // App holds the stores the evaluation operates on.
 type App struct {
@@ -29,12 +35,21 @@ func New() *App {
 	}
 }
 
-// Compare evaluates every test term with the evaluation algorithm and logs its
-// full-corpus relevance scores.
-func (a *App) Compare(ctx context.Context) error {
+// Compare evaluates every test term with each of the given algorithms against
+// the same index, logs their full-corpus relevance scores, then prints a table
+// comparing each algorithm's NDCG. An empty algorithms slice evaluates every
+// registered algorithm.
+func (a *App) Compare(ctx context.Context, algorithms []algorithm.SearchAlgorithm) error {
+	if len(algorithms) == 0 {
+		algorithms = algorithm.AllSearchAlgorithms()
+	}
+
 	return a.withElasticsearch(ctx, func(ctx context.Context, esClient dpEsClient.Client) error {
-		_, err := a.evaluateTerms(ctx, esClient)
-		return err
+		evaluations, err := a.evaluateTerms(ctx, esClient, algorithms)
+		if err != nil {
+			return err
+		}
+		return reportComparison(evaluations)
 	})
 }
 
@@ -46,7 +61,7 @@ func (a *App) Export(ctx context.Context, outputPath string) error {
 	}
 
 	return a.withElasticsearch(ctx, func(ctx context.Context, esClient dpEsClient.Client) error {
-		evaluations, err := a.evaluateTerms(ctx, esClient)
+		evaluations, err := a.evaluateTerms(ctx, esClient, []algorithm.SearchAlgorithm{exportAlgorithm})
 		if err != nil {
 			return err
 		}

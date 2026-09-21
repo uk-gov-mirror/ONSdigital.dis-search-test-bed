@@ -14,9 +14,6 @@ import (
 )
 
 const (
-	// evaluationAlgorithm is the search algorithm whose ranking is evaluated.
-	evaluationAlgorithm = algorithm.SearchAlgorithmBaseline
-
 	// searchableTimeout bounds how long we wait for freshly indexed documents
 	// to become searchable (Elasticsearch is near-real-time).
 	searchableTimeout  = 5 * time.Second
@@ -56,11 +53,22 @@ type evaluatedHit struct {
 }
 
 type termEvaluation struct {
-	Term term
-	Hits []evaluatedHit
-	DCG  float64
-	IDCG float64
-	NDCG float64
+	Algorithm algorithm.SearchAlgorithm
+	Term      term
+	Hits      []evaluatedHit
+	DCG       float64
+	IDCG      float64
+	NDCG      float64
+}
+
+// evaluationContext is the per-run data shared by every term and algorithm. It
+// is loaded once, so evaluating another algorithm costs only its searches and
+// not a second pass over the fixtures or another wait for the index.
+type evaluationContext struct {
+	documentByID    map[string]documentMetadata
+	corpusSize      int
+	terms           []term
+	relevanceByTerm map[string]map[string]int // term id -> document id -> relevance
 }
 
 // msearchResponse is the subset of an Elasticsearch _msearch response we need:
@@ -80,15 +88,57 @@ type countResponse struct {
 	Count int `json:"count"`
 }
 
-// evaluateTerms queries Elasticsearch for every test term using the evaluation
-// algorithm, then returns and logs its full-corpus relevance evaluation.
-func (a *App) evaluateTerms(ctx context.Context, esClient dpEsClient.Client) ([]termEvaluation, error) {
-	registry := algorithm.NewRequestRegistry([]algorithm.SearchAlgorithm{evaluationAlgorithm})
-	builder, err := registry.GetRequestBuilder(evaluationAlgorithm)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get request builder")
+// evaluateTerms queries Elasticsearch for every test term with each of the
+// given algorithms, then returns and logs their full-corpus relevance
+// evaluations. Results are algorithm-major: every term of the first algorithm,
+// then every term of the second, and so on.
+func (a *App) evaluateTerms(ctx context.Context, esClient dpEsClient.Client,
+	algorithms []algorithm.SearchAlgorithm) ([]termEvaluation, error) {
+	if len(algorithms) == 0 {
+		return nil, errors.New("at least one search algorithm is required")
 	}
 
+	// Resolve every builder before the first search, so a missing builder
+	// fails the run up front rather than part way through it.
+	registry := algorithm.NewRequestRegistry(algorithms)
+	builders := make([]algorithm.SearchRequestBuilder, 0, len(algorithms))
+	for _, algo := range algorithms {
+		builder, err := registry.BuilderFor(algo)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to get request builder for algorithm %q", algo)
+		}
+		builders = append(builders, builder)
+	}
+
+	evalCtx, err := a.loadEvaluationContext(ctx, esClient)
+	if err != nil {
+		return nil, err
+	}
+
+	evaluations := make([]termEvaluation, 0, len(algorithms)*len(evalCtx.terms))
+	for i, algo := range algorithms {
+		for _, t := range evalCtx.terms {
+			evaluation, err := evaluateTerm(ctx, esClient, builders[i], algo, t, evalCtx)
+			if err != nil {
+				return nil, err
+			}
+
+			evaluations = append(evaluations, evaluation)
+
+			ui.Info("term %q (%s) [%s]: DCG=%.4f IDCG=%.4f NDCG=%.4f",
+				t.Query, t.ID, algo,
+				evaluation.DCG, evaluation.IDCG, evaluation.NDCG)
+		}
+	}
+
+	return evaluations, nil
+}
+
+// loadEvaluationContext loads everything an evaluation run needs that does not
+// depend on the algorithm: the document corpus and its metadata, the test
+// terms, and each term's relevance answer key. It also waits for the indexed
+// documents to become searchable.
+func (a *App) loadEvaluationContext(ctx context.Context, esClient dpEsClient.Client) (*evaluationContext, error) {
 	documents, err := a.Documents.List(ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to list documents")
@@ -103,13 +153,14 @@ func (a *App) evaluateTerms(ctx context.Context, esClient dpEsClient.Client) ([]
 		return nil, err
 	}
 
-	terms, err := a.Terms.List(ctx)
+	items, err := a.Terms.List(ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to list terms")
 	}
 
-	evaluations := make([]termEvaluation, 0, len(terms))
-	for _, item := range terms {
+	terms := make([]term, 0, len(items))
+	relevanceByTerm := make(map[string]map[string]int, len(items))
+	for _, item := range items {
 		var t term
 		if err := json.Unmarshal(item.Body, &t); err != nil {
 			return nil, errors.Wrapf(err, "failed to parse term %q", item.Name)
@@ -120,58 +171,71 @@ func (a *App) evaluateTerms(ctx context.Context, esClient dpEsClient.Client) ([]
 			return nil, err
 		}
 
-		searches, err := builder.BuildRequest(ctx, &algorithm.SearchParameters{
-			Term:  t.Query,
-			Index: indexNameDocuments,
-			From:  0,
-			Size:  len(documents),
-		})
-		if err != nil {
-			return nil, errors.Wrapf(err, "failed to build request for term %q", t.ID)
-		}
-
-		raw, err := esClient.MultiSearch(ctx, searches, nil)
-		if err != nil {
-			return nil, errors.Wrapf(err, "failed to query term %q", t.ID)
-		}
-
-		rankedIDs, err := parseRankedIDs(raw)
-		if err != nil {
-			return nil, errors.Wrapf(err, "failed to parse response for term %q", t.ID)
-		}
-
-		hits := make([]evaluatedHit, 0, len(rankedIDs))
-		for rank, id := range rankedIDs {
-			document, ok := documentByID[id]
-			if !ok {
-				return nil, errors.Errorf("search returned document %q which is not in the document store", id)
-			}
-			relevance, judged := relevanceByDoc[id]
-			hits = append(hits, evaluatedHit{
-				DocumentID: id,
-				Rank:       rank + 1,
-				Relevance:  relevance,
-				Judged:     judged,
-				Title:      document.Title,
-				URI:        document.URI,
-			})
-		}
-
-		dcg, idcg, ndcg := scoreRanking(rankedIDs, relevanceByDoc)
-		evaluations = append(evaluations, termEvaluation{
-			Term: t,
-			Hits: hits,
-			DCG:  dcg,
-			IDCG: idcg,
-			NDCG: ndcg,
-		})
-
-		ui.Info("term %q (%s) [%s]: DCG=%.4f IDCG=%.4f NDCG=%.4f",
-			t.Query, t.ID, evaluationAlgorithm,
-			dcg, idcg, ndcg)
+		terms = append(terms, t)
+		relevanceByTerm[t.ID] = relevanceByDoc
 	}
 
-	return evaluations, nil
+	return &evaluationContext{
+		documentByID:    documentByID,
+		corpusSize:      len(documents),
+		terms:           terms,
+		relevanceByTerm: relevanceByTerm,
+	}, nil
+}
+
+// evaluateTerm runs one term through one algorithm and scores the ranking it
+// returns against the term's relevance answer key.
+func evaluateTerm(ctx context.Context, esClient dpEsClient.Client, builder algorithm.SearchRequestBuilder,
+	algo algorithm.SearchAlgorithm, t term, evalCtx *evaluationContext) (termEvaluation, error) {
+	searches, err := builder.BuildRequest(ctx, &algorithm.SearchParameters{
+		Term:  t.Query,
+		Index: indexNameDocuments,
+		From:  0,
+		Size:  evalCtx.corpusSize,
+	})
+	if err != nil {
+		return termEvaluation{}, errors.Wrapf(err, "failed to build request for term %q with algorithm %q", t.ID, algo)
+	}
+
+	raw, err := esClient.MultiSearch(ctx, searches, nil)
+	if err != nil {
+		return termEvaluation{}, errors.Wrapf(err, "failed to query term %q with algorithm %q", t.ID, algo)
+	}
+
+	rankedIDs, err := parseRankedIDs(raw)
+	if err != nil {
+		return termEvaluation{}, errors.Wrapf(err, "failed to parse response for term %q with algorithm %q", t.ID, algo)
+	}
+
+	relevanceByDoc := evalCtx.relevanceByTerm[t.ID]
+
+	hits := make([]evaluatedHit, 0, len(rankedIDs))
+	for rank, id := range rankedIDs {
+		document, ok := evalCtx.documentByID[id]
+		if !ok {
+			return termEvaluation{}, errors.Errorf("search returned document %q which is not in the document store", id)
+		}
+		relevance, judged := relevanceByDoc[id]
+		hits = append(hits, evaluatedHit{
+			DocumentID: id,
+			Rank:       rank + 1,
+			Relevance:  relevance,
+			Judged:     judged,
+			Title:      document.Title,
+			URI:        document.URI,
+		})
+	}
+
+	dcg, idcg, ndcg := scoreRanking(rankedIDs, relevanceByDoc)
+
+	return termEvaluation{
+		Algorithm: algo,
+		Term:      t,
+		Hits:      hits,
+		DCG:       dcg,
+		IDCG:      idcg,
+		NDCG:      ndcg,
+	}, nil
 }
 
 func buildDocumentMetadata(documents []stream.Item) (map[string]documentMetadata, error) {
