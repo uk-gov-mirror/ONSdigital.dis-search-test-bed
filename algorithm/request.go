@@ -3,6 +3,7 @@ package algorithm
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/ONSdigital/dp-elasticsearch/v4/client"
 )
@@ -57,6 +58,19 @@ func NewRequestRegistry(algorithms []SearchAlgorithm) *RequestRegistry {
 	return &RequestRegistry{
 		builders: builders,
 	}
+}
+
+// BuilderFor returns the request builder registered for the provided search
+// algorithm.
+// Unlike GetRequestBuilder it never falls back to the baseline builder: an
+// algorithm with no registered builder is an error, so results can never be
+// attributed to an algorithm that did not produce them.
+func (f *RequestRegistry) BuilderFor(algo SearchAlgorithm) (SearchRequestBuilder, error) {
+	builder, exists := f.builders[algo]
+	if !exists {
+		return nil, fmt.Errorf("no request builder registered for search algorithm %q", algo)
+	}
+	return builder, nil
 }
 
 // GetRequestBuilder returns a RequestBuilder based on the

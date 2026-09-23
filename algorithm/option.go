@@ -1,5 +1,10 @@
 package algorithm
 
+import (
+	"fmt"
+	"strings"
+)
+
 // SearchAlgorithm represents the type of search algorithm to be
 // used in the search request.
 type SearchAlgorithm string
@@ -10,6 +15,75 @@ const (
 	// SearchAlgorithmUnweighted represents the unweighted search algorithm.
 	SearchAlgorithmUnweighted SearchAlgorithm = "unweighted"
 )
+
+// AllSearchAlgorithms returns every registered search algorithm in canonical
+// order. It is the single source of truth for which algorithms can be
+// evaluated, so CLI defaults, help text and name validation all derive from
+// it and a newly registered algorithm is picked up by each of them.
+func AllSearchAlgorithms() []SearchAlgorithm {
+	return []SearchAlgorithm{
+		SearchAlgorithmBaseline,
+		SearchAlgorithmUnweighted,
+	}
+}
+
+// SearchAlgorithmNames returns the name of every registered search algorithm,
+// for CLI help text and error messages.
+func SearchAlgorithmNames() []string {
+	algorithms := AllSearchAlgorithms()
+	names := make([]string, 0, len(algorithms))
+	for _, algo := range algorithms {
+		names = append(names, string(algo))
+	}
+	return names
+}
+
+// ParseSearchAlgorithm resolves a name to its search algorithm, ignoring
+// surrounding whitespace and case. An unrecognised name is an error rather
+// than a silent fallback to the baseline algorithm, so a mistyped name can
+// never have baseline results reported under it.
+func ParseSearchAlgorithm(name string) (SearchAlgorithm, error) {
+	candidate := SearchAlgorithm(strings.ToLower(strings.TrimSpace(name)))
+	for _, algo := range AllSearchAlgorithms() {
+		if candidate == algo {
+			return algo, nil
+		}
+	}
+
+	return "", fmt.Errorf("unknown algorithm %q: valid algorithms are %s",
+		name, strings.Join(SearchAlgorithmNames(), ", "))
+}
+
+// ParseSearchAlgorithms resolves a list of names to their search algorithms,
+// discarding duplicates and preserving canonical order. An empty list, or one
+// holding only blank names, resolves to every registered algorithm.
+func ParseSearchAlgorithms(names []string) ([]SearchAlgorithm, error) {
+	selected := make(map[SearchAlgorithm]struct{}, len(names))
+	for _, name := range names {
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+
+		algo, err := ParseSearchAlgorithm(name)
+		if err != nil {
+			return nil, err
+		}
+		selected[algo] = struct{}{}
+	}
+
+	if len(selected) == 0 {
+		return AllSearchAlgorithms(), nil
+	}
+
+	algorithms := make([]SearchAlgorithm, 0, len(selected))
+	for _, algo := range AllSearchAlgorithms() {
+		if _, ok := selected[algo]; ok {
+			algorithms = append(algorithms, algo)
+		}
+	}
+
+	return algorithms, nil
+}
 
 // QueryName represents the name of a specific query type used
 // in search requests.
